@@ -93,21 +93,24 @@
  
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -1087,6 +1087,17 @@
- 	/* call machine-layer panic handler */
- 	ml_panic_trap_to_debugger(panic_format_str, panic_args, reason, ctx, panic_options_mask, panic_caller);
- 
+@@ -1283,7 +1283,20 @@
+ 			_doprnt(debugger_panic_str, debugger_panic_args, consdebug_putc, 0);
+ #pragma clang diagnostic pop
+ 		}
+ 		paniclog_append_noflush("\n");
 +#if defined(SWEET)
-+	/*
-+	 * The panic text is in the console ring now; write the ring to disk before
-+	 * the reset so the next recovery can read why this boot died.
-+	 */
-+	{
-+		extern void sweet_log_panic_flush(void);
-+		sweet_log_panic_flush();
-+	}
++		/*
++		 * handle_debugger_trap() calls console_suspend() before this runs, so
++		 * the string above went straight out through _cnputs() and is in the
++		 * console ring. The log thread is halted by now, so write the ring out
++		 * here - the only point where the panic text is both in the ring and
++		 * still ahead of the reset.
++		 */
++		{
++			extern void sweet_log_panic_flush(void);
++			sweet_log_panic_flush();
++		}
 +#endif
-+
- 	/* track depth of debugger/panic entry */
- 	CPUDEBUGGERCOUNT++;
- 
+ 	}
+ #if defined(__x86_64__)
+ 	else if (((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
