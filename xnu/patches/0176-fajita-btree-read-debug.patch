@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 72bebdf..b99860a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -461,6 +461,12 @@ sweet_ufs_strategy(buf_t bp)
+ 		buf_setresid(bp, count - done);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
++	if (rd && !error && vaddr && count >= 4096) {
++		printf("SWEETDBG read off=%llu len=%u lba=%llu head=%02x%02x%02x%02x\n",
++		    (unsigned long long)off, count,
++		    (unsigned long long)(su.first_block + off / UFS_BLOCK),
++		    (uint8_t)vaddr[0], (uint8_t)vaddr[1], (uint8_t)vaddr[2], (uint8_t)vaddr[3]);
++	}
+ 	buf_unmap(bp);
+ 
+ done:
+@@ -656,6 +662,29 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	{
++		/* Raw device probes, independent of HFS: known catalog node offsets. */
++		static const struct {
++			uint64_t off;
++			const char *what;
++		} probe[] = {
++			{ 1024, "vhdr" },
++			{ 754720768ull, "cat-node288" },
++			{ 7220703232ull, "cat-node19362" },
++		};
++		const uint8_t *d = (const uint8_t *)(su.dma + DMA_BOUNCE);
++		for (unsigned i = 0; i < 3; i++) {
++			uint64_t blk = probe[i].off / UFS_BLOCK;
++			int e = ufs_read_blocks(su.first_block + blk, 1);
++			if (e) {
++				printf("SWEETDBG probe %s: error %d\n", probe[i].what, e);
++				continue;
++			}
++			printf("SWEETDBG probe %s lba=%llu: %02x%02x%02x%02x %02x%02x%02x%02x\n",
++			    probe[i].what, (unsigned long long)(su.first_block + blk),
++			    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
++		}
++	}
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
