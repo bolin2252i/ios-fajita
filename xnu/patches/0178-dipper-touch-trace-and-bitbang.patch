@@ -1,0 +1,297 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -110,6 +110,9 @@
+ #define GENI_IF_DISABLE 0x064u  /* RO mirror of SE_FIFO_IF_DISABLE bit0 */
+ #define SE_CLK_SEL      0x07cu
+ #define GENI_IOS        0x908u
++#define SE_CGC_CTRL     0x028u
++#define SE_CLK_CTRL     0x2000u
++#define SE_DMA_IF_EN    0x2004u
+ #define SE_FIFO_IF_DISABLE 0x2008u
+ #define SE_DMA          0x258u
+ #define SE_TX_LEN       0x26cu
+@@ -142,7 +145,7 @@
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio, gpio_s, gpio_e;   /* north, south, east */
+-	bool started, dead, probing;
++	bool started, dead, probing, bb;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+@@ -592,13 +595,25 @@
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, GENI_IOS), ifd);
+ 	if (ifd & 1u) {
+-		/* The bootloader may hand over an SE configured for the GPI/DMA
+-		 * path, which turns the FIFO interface off (this is what dipper's
+-		 * ABL does for the touch SE). Linux clears the same bit in
+-		 * geni_configure_xfer_mode() when it selects GENI_SE_FIFO. */
+-		touch_wr(st.se, SE_FIFO_IF_DISABLE,
+-		    touch_rd(st.se, SE_FIFO_IF_DISABLE) & ~1u);
+-		printf("SWEET TOUCH: fifo if cleared ram=%#x ifd=%#x\n",
++		/* ABL hands the touch SE over on the GPI/DMA path: FIFO_IF_DISABLE
++		 * is set and Linux would switch to GPI DMA instead of FIFO. We have
++		 * no GPI, so clear the bit - but the 0x2000 block may still need the
++		 * config-RAM clocks (SE_GENI_CGC_CTRL PROG_RAM_*) toggled the way
++		 * geni_se.c does. Every step is printed separately because an AHB
++		 * access to a gated block never returns. */
++		uint32_t cgc = touch_rd(st.se, SE_CGC_CTRL);
++		printf("SWEET TOUCH: ifd=1 cgc=%#x; entering cfg block\n", cgc);
++		uint32_t ck = touch_rd(st.se, SE_CLK_CTRL);
++		printf("SWEET TOUCH: clk_ctrl=%#x\n", ck);
++		touch_wr(st.se, SE_CLK_CTRL, ck & 1u);
++		printf("SWEET TOUCH: clk_ctrl written\n");
++		uint32_t dmaif = touch_rd(st.se, SE_DMA_IF_EN);
++		printf("SWEET TOUCH: dma_if=%#x\n", dmaif);
++		touch_wr(st.se, SE_DMA_IF_EN, dmaif | 1u);
++		uint32_t fifo = touch_rd(st.se, SE_FIFO_IF_DISABLE);
++		printf("SWEET TOUCH: fifo_if=%#x\n", fifo);
++		touch_wr(st.se, SE_FIFO_IF_DISABLE, fifo & ~1u);
++		printf("SWEET TOUCH: fifo_if cleared ram=%#x ifd=%#x\n",
+ 		    touch_rd(st.se, SE_FIFO_IF_DISABLE),
+ 		    touch_rd(st.se, GENI_IF_DISABLE));
+ 	}
+@@ -953,6 +968,140 @@
+ 
+ /* ------------------------------------------------------------------ dipper */
+ 
++/* ------------------------------------------------------- dipper bit-bang */
++/*
++ * The SE hands over with FIFO_IF_DISABLE set and its 0x2000 block refusing AHB
++ * access, so sweetts=3 drives SDA/SCL as open-drain GPIOs instead. The internal
++ * pull-up is the only bias, transfers run at about 100 kHz, and SCL held low
++ * between bits is legal I2C, so a preemption cannot corrupt a byte.
++ */
++#define BB_SDA  DP_GPIO_SDA
++#define BB_SCL  DP_GPIO_SCL
++#define BB_US   5u
++
++/* Pull the line down by enabling the output driver at 0; release it by turning
++ * the driver off and letting the pull-up raise the line. Never drive high. */
++static void
++bb_pull_low(unsigned pin)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(pin),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(pin)) | 0x200u);
++}
++
++static void
++bb_release(unsigned pin)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(pin),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(pin)) & ~0x200u);
++}
++
++static bool
++bb_sense(unsigned pin)
++{
++	return (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u) != 0;
++}
++
++static void
++bb_start(void)
++{
++	bb_release(BB_SDA);
++	bb_release(BB_SCL);
++	delay(BB_US);
++	bb_pull_low(BB_SDA);
++	delay(BB_US);
++	bb_pull_low(BB_SCL);
++	delay(BB_US);
++}
++
++static void
++bb_stop(void)
++{
++	bb_pull_low(BB_SDA);
++	delay(BB_US);
++	bb_release(BB_SCL);
++	delay(BB_US);
++	bb_release(BB_SDA);
++	delay(BB_US);
++}
++
++static bool
++bb_tx_byte(uint8_t b)
++{
++	bool ack;
++
++	for (int i = 7; i >= 0; --i) {
++		if (b & (1u << i)) {
++			bb_release(BB_SDA);
++		} else {
++			bb_pull_low(BB_SDA);
++		}
++		delay(BB_US);
++		bb_release(BB_SCL);
++		delay(BB_US);
++		bb_pull_low(BB_SCL);
++		delay(BB_US);
++	}
++	bb_release(BB_SDA);            /* ACK slot: the IC may pull SDA low */
++	delay(BB_US);
++	bb_release(BB_SCL);
++	delay(BB_US);
++	ack = !bb_sense(BB_SDA);
++	bb_pull_low(BB_SCL);
++	delay(BB_US);
++	return ack;
++}
++
++static uint8_t
++bb_rx_byte(bool ack)
++{
++	uint8_t v = 0;
++
++	bb_release(BB_SDA);
++	for (unsigned i = 0; i < 8; ++i) {
++		delay(BB_US);
++		bb_release(BB_SCL);
++		delay(BB_US);
++		v = (uint8_t)((v << 1) | (bb_sense(BB_SDA) ? 1u : 0u));
++		bb_pull_low(BB_SCL);
++	}
++	if (ack) {
++		bb_pull_low(BB_SDA);
++	} else {
++		bb_release(BB_SDA);
++	}
++	delay(BB_US);
++	bb_release(BB_SCL);
++	delay(BB_US);
++	bb_pull_low(BB_SCL);
++	delay(BB_US);
++	bb_release(BB_SDA);
++	return v;
++}
++
++/* One address phase plus payload; a read continues on a repeated START. */
++static int
++bb_xfer(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr)
++{
++	bool acked;
++
++	bb_start();
++	acked = bb_tx_byte((uint8_t)(DP_TS_ADDR << 1));
++	for (unsigned i = 0; acked && i < nt; ++i) {
++		acked = bb_tx_byte(tx[i]);
++	}
++	if (acked && nr) {
++		bb_start();
++		acked = bb_tx_byte((uint8_t)((DP_TS_ADDR << 1) | 1u));
++		for (unsigned i = 0; acked && i < nr; ++i) {
++			rx[i] = bb_rx_byte(i + 1u < nr);
++		}
++	}
++	bb_stop();
++	return acked ? 0 : ENXIO;
++}
++
+ /*
+  * ST FingerTipS answers with the command and its address in one write, then
+  * the data on a repeated START that the GENI STOP_STRETCH bit already holds.
+@@ -967,6 +1116,9 @@
+ 	for (unsigned i = 0; i < alen; ++i) {
+ 		tx[1 + i] = (uint8_t)(addr >> (8u * (alen - 1u - i)));
+ 	}
++	if (st.bb) {
++		return bb_xfer(tx, 1u + alen, buf, len);
++	}
+ 	int err = touch_msg(DP_TS_ADDR, tx, 1u + alen, NULL, 0, true);
+ 	if (err) {
+ 		return err;
+@@ -984,6 +1136,9 @@
+ 	}
+ 	tx[0] = cmd;
+ 	memcpy(tx + 1, data, len);
++	if (st.bb) {
++		return bb_xfer(tx, len + 1u, NULL, 0);
++	}
+ 	return touch_msg(DP_TS_ADDR, tx, len + 1u, NULL, 0, false);
+ }
+ 
+@@ -1102,13 +1257,16 @@
+ 	printf("SWEET TS: dipper FTS, starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 
+-	st.gcc = ml_io_map(DP_GCC_PA, 0x60000);
+ 	st.gpio_s = ml_io_map(DP_TLMM_SOUTH, 0x80000);
+ 	st.gpio = ml_io_map(DP_TLMM_NORTH, 0x80000);
+-	st.se = ml_io_map(DP_SE_PA, 0x4000);
+-	printf("SWEET TS: maps gcc=%p north=%p south=%p se=%p\n",
+-	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.se);
+-	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
++	if (!st.bb) {
++		st.gcc = ml_io_map(DP_GCC_PA, 0x60000);
++		st.se = ml_io_map(DP_SE_PA, 0x4000);
++	}
++	printf("SWEET TS: maps gcc=%p north=%p south=%p se=%p bb=%d\n",
++	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.se,
++	    st.bb ? 1 : 0);
++	if (!st.gpio || !st.gpio_s || (!st.bb && (!st.gcc || !st.se))) {
+ 		printf("SWEET TS: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+@@ -1126,20 +1284,33 @@
+ 	touch_wait(10);                                /* vendor RESET_DELAY */
+ 	touch_gpio_at(st.gpio, DP_GPIO_RESET, 0, 3, 7, true, true);
+ 	touch_wait(200);
+-	if (!dipper_clocks()) {
+-		goto out;
+-	}
+-	if (!touch_se_init() || !dipper_recover()) {
+-		goto out;
++	if (st.bb) {
++		/* Both lines are already gpio-mode inputs with the pull-up on. */
++		printf("SWEET TS: bit-bang idle sda=%d scl=%d\n",
++		    bb_sense(BB_SDA) ? 1 : 0, bb_sense(BB_SCL) ? 1 : 0);
++	} else {
++		if (!dipper_clocks()) {
++			goto out;
++		}
++		if (!touch_se_init() || !dipper_recover()) {
++			goto out;
++		}
++		touch_gpio_at(st.gpio, DP_GPIO_SDA, DP_PIN_QUP14, 0, 0, false, false);
++		touch_gpio_at(st.gpio, DP_GPIO_SCL, DP_PIN_QUP14, 0, 0, false, false);
++		touch_wait(10);
+ 	}
+-	touch_gpio_at(st.gpio, DP_GPIO_SDA, DP_PIN_QUP14, 0, 0, false, false);
+-	touch_gpio_at(st.gpio, DP_GPIO_SCL, DP_PIN_QUP14, 0, 0, false, false);
+-	touch_wait(10);
+ 
+ 	st.probing = true;
+ 	uint8_t id[2] = {0}, fwv[2] = {0};
+-	int ierr = fts_read(FTS_CMD_HW_R, FTS_HW_CHIPID, 4, id, sizeof(id));
+-	int ferr = fts_read(FTS_CMD_HW_R, FTS_HW_FWVER, 4, fwv, sizeof(fwv));
++	int ierr = EIO, ferr = EIO;
++	for (unsigned attempt = 0; attempt < 10; ++attempt) {
++		ierr = fts_read(FTS_CMD_HW_R, FTS_HW_CHIPID, 4, id, sizeof(id));
++		if (!ierr) {
++			ferr = fts_read(FTS_CMD_HW_R, FTS_HW_FWVER, 4, fwv, sizeof(fwv));
++			break;
++		}
++		touch_wait(50);
++	}
+ 	st.probing = false;
+ 	printf("SWEET TS: chip id err=%d %02x%02x fw err=%d %02x%02x irq=%#x seen=%#x\n",
+ 	    ierr, id[0], id[1], ferr, fwv[0], fwv[1], st.irq_last, st.irq_status);
+@@ -1295,10 +1466,13 @@
+ 	}
+ 	int ts = 0;
+ 	(void)PE_parse_boot_argn("sweetts", &ts, sizeof(ts));
++	st.bb = (ts == 3);
+ 	printf("SWEET TS: %s selected (sweetts=%d)\n",
++	    ts == 3 ? "dipper FTS bit-bang" :
+ 	    ts == 2 ? "dipper FTS" : ts == 1 ? "fajita RMI4" : "sweet GT9896/FTS", ts);
+-	kern_return_t kr = kernel_thread_start(ts == 2 ? touch_dipper_thread :
+-	    ts == 1 ? touch_fajita_thread : touch_thread, NULL, &thread);
++	kern_return_t kr = kernel_thread_start(ts == 2 || ts == 3 ?
++	    touch_dipper_thread : ts == 1 ? touch_fajita_thread : touch_thread,
++	    NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
