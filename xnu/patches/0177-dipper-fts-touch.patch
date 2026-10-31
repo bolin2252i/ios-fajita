@@ -50,7 +50,18 @@
  #define TOUCH_MAX        10u
  #define TOUCH_GOODIX     1
  #define TOUCH_FTS        2
-@@ -239,12 +282,12 @@
+@@ -64,7 +107,10 @@
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+ #define SE_FW           0x068u
++#define GENI_IF_DISABLE 0x064u  /* RO mirror of SE_FIFO_IF_DISABLE bit0 */
+ #define SE_CLK_SEL      0x07cu
++#define GENI_IOS        0x908u
++#define SE_FIFO_IF_DISABLE 0x2008u
+ #define SE_DMA          0x258u
+ #define SE_TX_LEN       0x26cu
+ #define SE_RX_LEN       0x270u
+@@ -239,12 +285,12 @@
  	return st.irq_last;
  }
  
@@ -65,7 +76,7 @@
  		return EIO;
  	}
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
-@@ -293,11 +336,14 @@
+@@ -293,11 +339,14 @@
  			break;
  		}
  		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
@@ -84,7 +95,41 @@
  			st.sent = nt;
  			touch_wr(st.se, SE_TX_WM, 0);
  		}
-@@ -890,6 +936,243 @@
+@@ -538,17 +587,29 @@
+ {
+ 	uint32_t fw = touch_rd(st.se, SE_FW);
+ 	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	uint32_t ifd = touch_rd(st.se, GENI_IF_DISABLE);
++	printf("SWEET TOUCH: se fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x ifd=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+-	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
++	    touch_rd(st.se, GENI_IOS), ifd);
++	if (ifd & 1u) {
++		/* The bootloader may hand over an SE configured for the GPI/DMA
++		 * path, which turns the FIFO interface off (this is what dipper's
++		 * ABL does for the touch SE). Linux clears the same bit in
++		 * geni_configure_xfer_mode() when it selects GENI_SE_FIFO. */
++		touch_wr(st.se, SE_FIFO_IF_DISABLE,
++		    touch_rd(st.se, SE_FIFO_IF_DISABLE) & ~1u);
++		printf("SWEET TOUCH: fifo if cleared ram=%#x ifd=%#x\n",
++		    touch_rd(st.se, SE_FIFO_IF_DISABLE),
++		    touch_rd(st.se, GENI_IF_DISABLE));
++	}
++	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, GENI_IF_DISABLE) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+ 		printf("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+ 		return false;
+ 	}
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
++		printf("SWEET TOUCH: SE already busy; probes skipped\n");
+ 		return false;
+ 	}
+ 	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+@@ -890,6 +951,243 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -328,7 +373,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -995,13 +1278,12 @@
+@@ -995,13 +1293,12 @@
  		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
  		return;
  	}
