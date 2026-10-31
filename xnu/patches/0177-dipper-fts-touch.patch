@@ -1,0 +1,350 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -52,6 +52,49 @@
+ #define FJ_GPIO_RESET    99u
+ #define FJ_GPIO_VIO      88u
+ #define FJ_VOTE_MASK     ((1u << 20) | (1u << 21) | (1u << 26))
++
++/*
++ * dipper (Xiaomi Mi 8, SDM845): ST FingerTipS at I2C 0x49 on QUPv3 wrapper1
++ * SE6 (i2c@a98000, global SE14 = "qup14"), IRQ gpio31 and reset gpio32 (TLMM
++ * NORTH, function gpio), VDDIO switch gpio23 (TLMM SOUTH, active high), AVDD
++ * on PM8998 ldoa28 at 3.3 V. Select with boot-arg sweetts=2.
++ */
++#define DP_GCC_PA        0x00100000u
++#define DP_GCC_VOTE      0x5200cu
++#define DP_GCC_CBCR      0x18734u       /* WRAP1_S6 CBCR: bit31 = CLK_OFF */
++#define DP_GCC_RCG       0x18738u
++#define DP_TLMM_NORTH    0x03900000u
++#define DP_TLMM_SOUTH    0x03d00000u
++#define DP_SE_PA         0x0a98000u
++#define DP_TS_ADDR       0x49u
++#define DP_GPIO_IRQ      31u
++#define DP_GPIO_RESET    32u
++#define DP_GPIO_SDA      33u
++#define DP_GPIO_SCL      34u
++#define DP_GPIO_VDDIO    23u
++#define DP_PIN_QUP14     2u             /* gpio31-34: gpio, qup11, qup14 */
++#define DP_VOTE_MASK     ((1u << 20) | (1u << 21) | (1u << 28))
++#define DP_TS_XRAW       1079           /* vendor X_AXIS_MAX */
++#define DP_TS_YRAW       2247           /* vendor Y_AXIS_MAX */
++#define DP_HID_YMAX      2399           /* sweet_hid_touch() y ceiling */
++
++/* ST FingerTipS host protocol (fts_521): op code, optional big-endian address,
++ * then a repeated-start read. The I2C variants are 0x86/0xFA and have no
++ * dummy byte, unlike the SPI ones. */
++#define FTS_CMD_FIFO     0x86u
++#define FTS_CMD_HW_R     0xFAu
++#define FTS_CMD_SCAN     0xA0u
++#define FTS_EVENT_LEN    8u
++#define FTS_EVT_NONE     0x00u
++#define FTS_EVT_READY    0x03u
++#define FTS_EVT_ENTER    0x13u
++#define FTS_EVT_MOTION   0x23u
++#define FTS_EVT_LEAVE    0x33u
++#define FTS_SCAN_ACTIVE  0x00u
++#define FTS_SCAN_MULTI   0x01u
++#define FTS_HW_CHIPID    0x20000000u
++#define FTS_HW_FWVER     0x20000004u
++
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+@@ -239,12 +282,12 @@
+ 	return st.irq_last;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* One Linux-style FIFO message. TX is at most 8 bytes; RX at most 90. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || nt > 8 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+@@ -293,11 +336,14 @@
+ 			break;
+ 		}
+ 		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
++			/* 8-bit packing: four bytes per FIFO word, byte 0 in bits 7:0. */
++			for (unsigned w = 0; w * 4u < nt; ++w) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && w * 4u + j < nt; ++j) {
++					word |= (uint32_t)tx[w * 4u + j] << (8u * j);
++				}
++				touch_wr(st.se, SE_TX, word);
+ 			}
+-			touch_wr(st.se, SE_TX, word);
+ 			st.sent = nt;
+ 			touch_wr(st.se, SE_TX_WM, 0);
+ 		}
+@@ -890,6 +936,243 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* ------------------------------------------------------------------ dipper */
++
++/*
++ * ST FingerTipS answers with the command and its address in one write, then
++ * the data on a repeated START that the GENI STOP_STRETCH bit already holds.
++ * Addresses are big-endian; FIFO reads (0x86) carry none.
++ */
++static int
++fts_read(uint8_t cmd, uint32_t addr, unsigned alen, uint8_t *buf, unsigned len)
++{
++	uint8_t tx[5];
++
++	tx[0] = cmd;
++	for (unsigned i = 0; i < alen; ++i) {
++		tx[1 + i] = (uint8_t)(addr >> (8u * (alen - 1u - i)));
++	}
++	int err = touch_msg(DP_TS_ADDR, tx, 1u + alen, NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	return touch_msg(DP_TS_ADDR, NULL, 0, buf, len, false);
++}
++
++static int
++fts_write(uint8_t cmd, const uint8_t *data, unsigned len)
++{
++	uint8_t tx[8];
++
++	if (len + 1u > sizeof(tx)) {
++		return EIO;
++	}
++	tx[0] = cmd;
++	memcpy(tx + 1, data, len);
++	return touch_msg(DP_TS_ADDR, tx, len + 1u, NULL, 0, false);
++}
++
++static bool
++dipper_clocks(void)
++{
++	touch_wr(st.gcc, DP_GCC_VOTE, touch_rd(st.gcc, DP_GCC_VOTE) | DP_VOTE_MASK);
++	uint32_t cfg = touch_rd(st.gcc, DP_GCC_RCG + 4u);
++	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* XO parent, divide by 1 */
++	touch_wr(st.gcc, DP_GCC_RCG + 4u, cfg);
++	touch_wr(st.gcc, DP_GCC_RCG, touch_rd(st.gcc, DP_GCC_RCG) | 0x3u);
++	if (!touch_wait_clear(st.gcc, DP_GCC_RCG, 1u)) {
++		printf("SWEET TS: RCG update timeout (rcg=%#x)\n", touch_rd(st.gcc, DP_GCC_RCG));
++		return false;
++	}
++	for (unsigned i = 0; i < 200; ++i) {
++		if (!(touch_rd(st.gcc, DP_GCC_CBCR) & (1u << 31))) {
++			printf("SWEET TS: gcc vote=%#x s6 cbcr=%#x\n",
++			    touch_rd(st.gcc, DP_GCC_VOTE), touch_rd(st.gcc, DP_GCC_CBCR));
++			return true;
++		}
++		touch_wait(1);
++	}
++	printf("SWEET TS: SE6 clock still halted (cbcr=%#x)\n", touch_rd(st.gcc, DP_GCC_CBCR));
++	return false;
++}
++
++/* A command left running by an earlier owner makes every transfer wait out the
++ * 5 s idle check and then kills the driver, so clear the sequencer first. */
++static bool
++dipper_recover(void)
++{
++	if (!(touch_rd(st.se, SE_STATUS) & 0x1001u)) {
++		return true;
++	}
++	printf("SWEET TS: SE6 busy (status=%#x irq=%#x); aborting\n",
++	    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
++	touch_wr(st.se, SE_CTRL, 2);
++	for (unsigned i = 0; i < 5000 && !(touch_rd(st.se, SE_IRQ) & (1u << 5)); ++i) {
++		delay(1);
++	}
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)touch_rd(st.se, SE_RX);
++	}
++	printf("SWEET TS: after abort status=%#x tx=%#x rx=%#x irq=%#x\n",
++	    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_TX_COUNT),
++	    touch_rd(st.se, SE_RX_COUNT), touch_rd(st.se, SE_IRQ));
++	return !(touch_rd(st.se, SE_STATUS) & 1u);
++}
++
++static bool fts_ready;
++static unsigned fts_logged;
++
++/*
++ * Drain the event FIFO. Byte 7 of each event counts the events still queued
++ * (0..31), so read one at a time and stop when the FW reports none. Contacts
++ * are seeded from the last report: the FW only sends events on changes.
++ */
++static int
++fts_poll(void)
++{
++	uint8_t e[FTS_EVENT_LEN];
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	uint32_t mask = st.active;
++	unsigned batches = 0;
++
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		x[i] = st.x[i];
++		y[i] = st.y[i];
++	}
++	for (;;) {
++		int err = fts_read(FTS_CMD_FIFO, 0, 0, e, sizeof(e));
++		if (err) {
++			return err;
++		}
++		if (e[0] == FTS_EVT_NONE) {
++			break;
++		}
++		if (fts_logged < 8) {
++			fts_logged++;
++			printf("SWEET TS: fifo %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++		}
++		unsigned id = e[1] >> 4;
++		if (e[0] == FTS_EVT_READY) {
++			fts_ready = true;
++		} else if (e[0] == FTS_EVT_LEAVE) {
++			if (id < TOUCH_MAX) {
++				mask &= ~(1u << id);
++			}
++		} else if (e[0] == FTS_EVT_ENTER || e[0] == FTS_EVT_MOTION) {
++			/* x = bits 11:0 of byte 3 + byte 2; y = byte 4 + bits 15:12. */
++			unsigned px = (((unsigned)e[3] & 0x0fu) << 8) | e[2];
++			unsigned py = ((unsigned)e[4] << 4) | ((e[3] & 0xf0u) >> 4);
++			if (id < TOUCH_MAX && px <= DP_TS_XRAW && py <= DP_TS_YRAW) {
++				mask |= 1u << id;
++				x[id] = (int)px;
++				y[id] = (int)(py * DP_HID_YMAX / DP_TS_YRAW);
++			}
++		}
++		if ((e[7] & 0x1fu) == 0 || ++batches >= 32u) {
++			break;
++		}
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static void
++touch_dipper_thread(__unused void *arg, __unused wait_result_t result)
++{
++	unsigned delay_s = 20;
++
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET TS: dipper FTS, starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++
++	st.gcc = ml_io_map(DP_GCC_PA, 0x60000);
++	st.gpio_s = ml_io_map(DP_TLMM_SOUTH, 0x80000);
++	st.gpio = ml_io_map(DP_TLMM_NORTH, 0x80000);
++	st.se = ml_io_map(DP_SE_PA, 0x4000);
++	printf("SWEET TS: maps gcc=%p north=%p south=%p se=%p\n",
++	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.se);
++	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
++		printf("SWEET TS: MMIO mapping failed\n");
++		goto out;
++	}
++	/* AVDD is pm8998_l28 at 3.3 V; VDDIO is the gpio23 high-side switch. */
++	int perr = sweet_rpmh_vreg_enable("ldoa28", 3300);
++	printf("SWEET TS: ldoa28 vote -> %d\n", perr);
++
++	/* Hold reset low with the I2C pins parked as pulled-up inputs, then let the
++	 * FW boot; only then hand SDA/SCL to the SE (dt: qup14, 2 mA, no bias). */
++	touch_gpio_at(st.gpio, DP_GPIO_SDA, 0, 3, 0, false, false);
++	touch_gpio_at(st.gpio, DP_GPIO_SCL, 0, 3, 0, false, false);
++	touch_gpio_at(st.gpio, DP_GPIO_IRQ, 0, 3, 7, false, false);
++	touch_gpio_at(st.gpio_s, DP_GPIO_VDDIO, 0, 0, 7, true, true);
++	touch_gpio_at(st.gpio, DP_GPIO_RESET, 0, 3, 7, true, false);
++	touch_wait(10);                                /* vendor RESET_DELAY */
++	touch_gpio_at(st.gpio, DP_GPIO_RESET, 0, 3, 7, true, true);
++	touch_wait(200);
++	if (!dipper_clocks()) {
++		goto out;
++	}
++	if (!touch_se_init() || !dipper_recover()) {
++		goto out;
++	}
++	touch_gpio_at(st.gpio, DP_GPIO_SDA, DP_PIN_QUP14, 0, 0, false, false);
++	touch_gpio_at(st.gpio, DP_GPIO_SCL, DP_PIN_QUP14, 0, 0, false, false);
++	touch_wait(10);
++
++	st.probing = true;
++	uint8_t id[2] = {0}, fwv[2] = {0};
++	int ierr = fts_read(FTS_CMD_HW_R, FTS_HW_CHIPID, 4, id, sizeof(id));
++	int ferr = fts_read(FTS_CMD_HW_R, FTS_HW_FWVER, 4, fwv, sizeof(fwv));
++	st.probing = false;
++	printf("SWEET TS: chip id err=%d %02x%02x fw err=%d %02x%02x irq=%#x seen=%#x\n",
++	    ierr, id[0], id[1], ferr, fwv[0], fwv[1], st.irq_last, st.irq_status);
++	if (ierr || ferr) {
++		printf("SWEET TS: no answer at 0x49 on SE6; stopping\n");
++		goto out;
++	}
++	unsigned tries = 0;
++	while (!fts_ready && !st.dead && tries < 200) {
++		if (fts_poll() != 0) {
++			break;
++		}
++		touch_wait(10);
++		tries++;
++	}
++	printf("SWEET TS: ready event %s after %u ms (dead=%d)\n",
++	    fts_ready ? "seen" : "missing", tries * 10u, st.dead);
++	const uint8_t scan[2] = {FTS_SCAN_ACTIVE, FTS_SCAN_MULTI};
++	int serr = fts_write(FTS_CMD_SCAN, scan, sizeof(scan));
++	printf("SWEET TS: scan mode active -> %d\n", serr);
++
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		int err = fts_poll();
++		if (err) {
++			errors++;
++			if (errors == 1 || errors == 20) {
++				printf("SWEET TS: FIFO read keeps failing err=%d irq=%#x seen=%#x\n",
++				    err, st.irq_last, st.irq_status);
++			}
++			if (errors > 200) {
++				printf("SWEET TS: giving up on the controller\n");
++				break;
++			}
++		} else {
++			errors = 0;
++			if ((++ticks % 6000u) == 0) {
++				printf("SWEET TS: alive irq=%#x active=%#x\n", st.irq_last, st.active);
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -995,13 +1278,12 @@
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
+-	int fajita = 0;
+-	(void)PE_parse_boot_argn("sweetts", &fajita, sizeof(fajita));
+-	if (fajita) {
+-		printf("SWEET TS: fajita RMI4 selected (sweetts=1)\n");
+-	}
+-	kern_return_t kr = kernel_thread_start(fajita ? touch_fajita_thread : touch_thread,
+-	    NULL, &thread);
++	int ts = 0;
++	(void)PE_parse_boot_argn("sweetts", &ts, sizeof(ts));
++	printf("SWEET TS: %s selected (sweetts=%d)\n",
++	    ts == 2 ? "dipper FTS" : ts == 1 ? "fajita RMI4" : "sweet GT9896/FTS", ts);
++	kern_return_t kr = kernel_thread_start(ts == 2 ? touch_dipper_thread :
++	    ts == 1 ? touch_fajita_thread : touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {

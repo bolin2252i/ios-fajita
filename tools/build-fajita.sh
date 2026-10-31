@@ -45,10 +45,10 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 #
 # Defaults below are the usable configuration reached on 2026-10-23: eight
 # cores, the D22 identity, GUI on the panel (sweetfb_noconsole mutes the console
-# at the first swap), RMI4 touch and the PM8998 keys. Diagnostic switches for
-# the touch bring-up: sweetfb_console=1 (keep the console on the panel instead
-# of the GUI), sweetts_nogpio/noclk/nose/norail=1, sweettouchdelay=<s>.
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweetlog=1 sweettouch=1 sweetts=1 sweettouchdelay=20 sweetkeys=1 rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00"}
+# at the first swap), dipper FTS touch (SE6, 0x49) and the PM8998 keys.
+# Diagnostic switches for the touch bring-up: sweetfb_console=1 (keep the
+# console on the panel instead of the GUI), sweettouchdelay=<s>.
+CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweetlog=1 sweettouch=1 sweetts=2 sweettouchdelay=20 sweetkeys=1 rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00"}
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }
@@ -93,16 +93,12 @@ BLOB_ARGS+=(--blob "$GMEM_BLOB")
 # unusable for GPU memory here: this port keeps pages below gPhysBase on its free
 # lists and any pmap call on one panics (console80).
 # Size in MiB: Metal needs buffers/textures far beyond the old 1 MiB, and this blob is the only
-# GPU memory the pmap never has to touch. It travels in the payload, so it costs boot-image size,
-# not a userdata flash.
+# GPU memory the pmap never has to touch. Passed as a zero-fill segment (mkpayload.py zero:SIZE),
+# so it costs no boot-image bytes: the shim clears vmsize - file_size at load time. It still
+# cannot exceed what fits between kernel_end and phys_base + memSize.
 ARENA_MIB=${ARENA_MIB:-64}
-ARENA_BLOB=${ARENA_BLOB:-$HOME/gpu-fw/arena.bin}
-if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne $((ARENA_MIB * 1048576)) ]]; then
-	mkdir -p "$(dirname "$ARENA_BLOB")"
-	dd if=/dev/zero of="$ARENA_BLOB" bs=1048576 count="$ARENA_MIB" status=none
-fi
-echo "arena: $ARENA_MIB MiB"
-BLOB_ARGS+=(--blob "$ARENA_BLOB")
+echo "arena: $ARENA_MIB MiB (zero-filled at load)"
+BLOB_ARGS+=(--blob "zero:$((ARENA_MIB * 1048576))")
 # A fourth blob: the GPU page-table pool (stage 8f). 512 L3 tables of 4 KiB, each covering
 # a 2 MiB chunk of client address space - one per chunk of the whole 1 GiB range, because
 # QuartzCore spreads its buffers across it and 64 tables (128 MiB) ran out on the first
